@@ -93,6 +93,7 @@
   <div id="controls">
     <button id="reset" title="Reset camera">Reset view</button>
     <button id="wireframe" title="Toggle wireframe">Wireframe</button>
+    <button id="surface-angle" title="Color faces by surface angle (normal direction)">Surface angle</button>
     <button id="rotate" title="Auto-rotate">Auto-rotate</button>
     <span class="spacer"></span>
     <span class="label" id="dims"></span>
@@ -212,6 +213,26 @@
       let gridHelper = null;
       let mesh = null;
       let wireframeOn = false;
+      let surfaceAngleOn = false;
+
+      // Two materials we swap between. Standard is the default look; surface-
+      // angle colors each face by the direction of its normal (R=X, G=Y, B=Z),
+      // the same conventional "normal map" coloring github.com's STL viewer
+      // uses for its Surface Angle mode.
+      const standardMaterial = new THREE.MeshStandardMaterial({
+        color: 0x6a92cc, metalness: 0.1, roughness: 0.65,
+        flatShading: false, side: THREE.DoubleSide,
+      });
+      const surfaceAngleMaterial = new THREE.MeshNormalMaterial({
+        side: THREE.DoubleSide, flatShading: true,
+      });
+
+      function applyMaterial() {
+        if (!mesh) return;
+        const m = surfaceAngleOn ? surfaceAngleMaterial : standardMaterial;
+        m.wireframe = wireframeOn;
+        mesh.material = m;
+      }
 
       fetchSTL(path).then(({ buf, url }) => {
         const loader = new STLLoader();
@@ -225,11 +246,7 @@
         geometry.computeBoundingBox();
         geometry.computeVertexNormals();
 
-        const mat = new THREE.MeshStandardMaterial({
-          color: 0x6a92cc, metalness: 0.1, roughness: 0.65, flatShading: false,
-          side: THREE.DoubleSide,
-        });
-        mesh = new THREE.Mesh(geometry, mat);
+        mesh = new THREE.Mesh(geometry, standardMaterial);
         scene.add(mesh);
 
         const bbox = geometry.boundingBox;
@@ -283,11 +300,17 @@
         showError(err.message, `Couldn't fetch <code>${path}</code>: ${err.message}<br>The file might exceed jsDelivr's 50 MB limit, or the path might be wrong.`);
       });
 
-      // Wireframe toggle
+      // Wireframe toggle (works in either material)
       document.getElementById('wireframe').addEventListener('click', (e) => {
         wireframeOn = !wireframeOn;
-        if (mesh) mesh.material.wireframe = wireframeOn;
+        applyMaterial();
         e.currentTarget.classList.toggle('active', wireframeOn);
+      });
+      // Surface angle toggle — swaps to MeshNormalMaterial (color = face normal direction)
+      document.getElementById('surface-angle').addEventListener('click', (e) => {
+        surfaceAngleOn = !surfaceAngleOn;
+        applyMaterial();
+        e.currentTarget.classList.toggle('active', surfaceAngleOn);
       });
       // Auto-rotate toggle
       document.getElementById('rotate').addEventListener('click', (e) => {
