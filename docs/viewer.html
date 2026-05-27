@@ -46,6 +46,9 @@
     #controls button.active { background: var(--accent); color: #0d1117; border-color: var(--accent); }
     #controls .spacer { flex: 1; }
     #controls .label { color: var(--muted); }
+    #hover-label { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 11px; color: var(--accent); margin-right: 14px; }
+    #canvas { cursor: default; }
+    #canvas.hovering-part { cursor: pointer; }
 
     #loading {
       position: fixed; inset: 41px 0 38px 0; display: flex; align-items: center; justify-content: center;
@@ -95,7 +98,9 @@
     <button id="wireframe" title="Toggle wireframe">Wireframe</button>
     <button id="surface-angle" title="Color faces by surface angle (normal direction)">Surface angle</button>
     <button id="rotate" title="Auto-rotate">Auto-rotate</button>
+    <button id="show-all" title="Show any hidden parts" style="display: none">Show all</button>
     <span class="spacer"></span>
+    <span class="label" id="hover-label"></span>
     <span class="label" id="dims"></span>
   </div>
 
@@ -283,6 +288,8 @@
         geom.computeVertexNormals();
         geom.computeBoundingBox();
         const mesh = new THREE.Mesh(geom, standardMaterial);
+        mesh.userData.stlPath = p;
+        mesh.userData.fileName = p.split('/').pop();
         assembly.add(mesh);
         meshes.push(mesh);
         totalTris += geom.attributes.position.count / 3;
@@ -349,12 +356,276 @@
       document.getElementById('surface-angle').addEventListener('click', (e) => {
         surfaceAngleOn = !surfaceAngleOn;
         applyMaterial();
+        updateOutlineColor();
         e.currentTarget.classList.toggle('active', surfaceAngleOn);
       });
       document.getElementById('rotate').addEventListener('click', (e) => {
         controls.autoRotate = !controls.autoRotate;
         e.currentTarget.classList.toggle('active', controls.autoRotate);
       });
+
+      // ----- Hover/click interaction on assembled parts -----
+      // Raycast against assembly children. Hover -> outline + show filename in
+      // bottom-right. Click (not drag) -> open that part's STL in a new tab.
+      const raycaster = new THREE.Raycaster();
+      const ndc = new THREE.Vector2();
+      const canvas = document.getElementById('canvas');
+      const hoverLabel = document.getElementById('hover-label');
+      let hoveredMesh = null;
+      let pointerDownPos = null;
+      let isPointerDown = false;
+      let pendingMoveEvt = null;  // throttle pointermove to one rAF tick
+      let lastMouseEvent = null;
+      let shiftDown = false;
+      let peekHiddenMesh = null;  // temporarily hidden while Shift+hovering
+
+      // Hover outline. Color adapts to active material so it stays visible
+      // in both modes (blue on standard, black on Surface Angle).
+      const outlineMaterial = new THREE.LineBasicMaterial({
+        color: 0x58a6ff,
+        transparent: true,
+        opacity: 0.95,
+      });
+      function updateOutlineColor() {
+        outlineMaterial.color.setHex(surfaceAngleOn ? 0x000000 : 0x58a6ff);
+      }
+
+      function ensureOutline(mesh) {
+        if (mesh.userData.outline) return mesh.userData.outline;
+        // 30° angle threshold -> only feature edges, not every triangle.
+        // For a 1.4M-triangle part this still costs ~200 ms; we precompute
+        // these in the background so first-hover is instant.
+        const edges = new THREE.EdgesGeometry(mesh.geometry, 30);
+        const outline = new THREE.LineSegments(edges, outlineMaterial);
+        outline.renderOrder = 2;
+        mesh.userData.outline = outline;
+        return outline;
+      }
+
+      function setHover(mesh) {
+        if (hoveredMesh === mesh) return;
+        if (hoveredMesh) {
+          const prevOutline = hoveredMesh.userData.outline;
+          if (prevOutline && prevOutline.parent === hoveredMesh) hoveredMesh.remove(prevOutline);
+        }
+        hoveredMesh = mesh;
+        if (mesh) {
+          mesh.add(ensureOutline(mesh));
+          hoverLabel.textContent = mesh.userData.fileName || '';
+          canvas.classList.add('hovering-part');
+        } else {
+          hoverLabel.textContent = '';
+          canvas.classList.remove('hovering-part');
+        }
+      }
+
+      function pickAt(clientX, clientY) {
+        const rect = canvas.getBoundingClientRect();
+        ndc.x =  ((clientX - rect.left) / rect.width)  * 2 - 1;
+        ndc.y = -((clientY - rect.top)  / rect.height) * 2 + 1;
+        raycaster.setFromCamera(ndc, camera);
+        const hits = raycaster.intersectObjects(meshes, false);
+        return hits.length ? hits[0].object : null;
+      }
+
+      function processHover() {
+        if (!lastMouseEvent) return;
+        const x = lastMouseEvent.clientX, y = lastMouseEvent.clientY;
+        if (shiftDown) {
+          // pickAnyAt prevents avalanche: if the peeked mesh is still topmost
+          // (when all visible), we keep peeking it instead of "hopping" to the
+          // mesh behind it as soon as it becomes invisible.
+          const hit = pickAnyAt(x, y);
+          if (hit && hit.visible) startPeek(hit);
+          else if (!hit || hit !== peekHiddenMesh) endPeek();
+        } else {
+          setHover(pickAt(x, y));
+        }
+      }
+
+      canvas.addEventListener('pointermove', (e) => {
+        // Don't update hover while the user is orbiting the camera — the lag
+        // came from dragging through many parts and computing/swapping outlines
+        // each frame.
+        if (isPointerDown) return;
+        lastMouseEvent = e;
+        // Throttle hover picking to once per animation frame.
+        if (!pendingMoveEvt) {
+          requestAnimationFrame(() => {
+            const ev = pendingMoveEvt;
+            pendingMoveEvt = null;
+            if (ev && !isPointerDown) processHover();
+          });
+        }
+        pendingMoveEvt = e;
+      });
+      canvas.addEventListener('pointerleave', () => { endPeek(); setHover(null); });
+      canvas.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;  // only track left-click drags for "click vs drag"
+        isPointerDown = true;
+        pointerDownPos = { x: e.clientX, y: e.clientY };
+        // Clear any hover state while dragging so nothing looks "stuck on".
+        setHover(null);
+      });
+      canvas.addEventListener('pointerup', (e) => {
+        if (e.button !== 0) return;
+        isPointerDown = false;
+        if (!pointerDownPos) return;
+        const dx = e.clientX - pointerDownPos.x;
+        const dy = e.clientY - pointerDownPos.y;
+        const dragged = Math.hypot(dx, dy) > 5;
+        pointerDownPos = null;
+        if (dragged) return;  // it was an orbit drag, not a click
+        if (e.shiftKey) {
+          // Shift+click = same toggle as right-click (works around Mac
+          // trackpad right-click ergonomics)
+          toggleVisibilityAt(e.clientX, e.clientY);
+          return;
+        }
+        const hit = pickAt(e.clientX, e.clientY);
+        if (hit && hit.userData.stlPath) {
+          const url = `viewer.html?stl=${encodeURIComponent(hit.userData.stlPath)}`;
+          window.open(url, '_blank', 'noopener');
+        }
+      });
+
+      // ----- Undo/redo for visibility actions -----
+      // Each action is a list of {mesh, from, to} entries. Undo restores
+      // `from`, redo restores `to`. Right-click hides one part (1-entry
+      // action); "Show all" can be a multi-entry action.
+      const undoStack = [];
+      const redoStack = [];
+      function recordAction(changes) {
+        if (!changes.length) return;
+        undoStack.push(changes);
+        redoStack.length = 0;
+      }
+      function applyState(action, key) {
+        for (const c of action) c.mesh.visible = c[key];
+      }
+      function undo() {
+        const action = undoStack.pop();
+        if (!action) return;
+        applyState(action, 'from');
+        redoStack.push(action);
+      }
+      function redo() {
+        const action = redoStack.pop();
+        if (!action) return;
+        applyState(action, 'to');
+        undoStack.push(action);
+      }
+
+      // Right-click / Shift+click: toggle visibility of the part under cursor.
+      // pickAnyAt sees through hidden parts (temporarily flips them visible
+      // for the raycast) so right-clicking a hidden part's area brings it
+      // back.
+      // OrbitControls binds right-click to PAN by default; disable that so it
+      // doesn't fight with us.
+      controls.mouseButtons.RIGHT = null;
+      function pickAnyAt(clientX, clientY) {
+        const saved = meshes.map(m => m.visible);
+        for (const m of meshes) m.visible = true;
+        const hit = pickAt(clientX, clientY);
+        meshes.forEach((m, i) => { m.visible = saved[i]; });
+        return hit;
+      }
+      function toggleVisibilityAt(clientX, clientY) {
+        const hit = pickAnyAt(clientX, clientY);
+        if (!hit) return;
+        // A peek-hidden mesh's REAL state is visible; account for that so a
+        // shift+click while peeking commits the hide instead of re-showing.
+        const wasReallyVisible = (hit === peekHiddenMesh) ? true : hit.visible;
+        const newReallyVisible = !wasReallyVisible;
+        if (hit === peekHiddenMesh) peekHiddenMesh = null;
+        if (hoveredMesh === hit) setHover(null);
+        hit.visible = newReallyVisible;
+        recordAction([{ mesh: hit, from: wasReallyVisible, to: newReallyVisible }]);
+      }
+      canvas.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        toggleVisibilityAt(e.clientX, e.clientY);
+      });
+
+      // ----- Shift-peek: hold Shift to temporarily hide the hovered part -----
+      function startPeek(mesh) {
+        if (peekHiddenMesh === mesh) return;
+        if (!mesh || !mesh.visible) return;  // can't peek-hide a really-hidden part
+        if (peekHiddenMesh) endPeek();
+        peekHiddenMesh = mesh;
+        if (hoveredMesh === mesh) setHover(null);
+        mesh.visible = false;
+        hoverLabel.textContent = mesh.userData.fileName || '';
+      }
+      function endPeek() {
+        if (!peekHiddenMesh) return;
+        peekHiddenMesh.visible = true;
+        peekHiddenMesh = null;
+        hoverLabel.textContent = '';
+      }
+
+      // "Show all" — restore visibility of any parts the user hid.
+      const showAllBtn = document.getElementById('show-all');
+      showAllBtn.style.display = '';
+      showAllBtn.addEventListener('click', () => {
+        const changes = [];
+        for (const m of meshes) {
+          if (!m.visible) {
+            changes.push({ mesh: m, from: false, to: true });
+            m.visible = true;
+          }
+        }
+        recordAction(changes);
+      });
+
+      // Keyboard shortcuts. Cross-platform: Cmd on macOS, Ctrl elsewhere.
+      // Cmd/Ctrl+Z = undo, Cmd/Ctrl+Y = redo, Cmd/Ctrl+Shift+Z = redo (Mac).
+      // Plain Shift starts peek-hide on the currently hovered part.
+      window.addEventListener('keydown', (e) => {
+        // Activate Shift-peek only when Shift is pressed alone — Cmd+Shift+Z
+        // for redo should NOT peek-hide a part.
+        if (e.key === 'Shift' && !shiftDown && !e.metaKey && !e.ctrlKey) {
+          shiftDown = true;
+          processHover();
+        }
+        if (!(e.metaKey || e.ctrlKey)) return;
+        const k = e.key.toLowerCase();
+        if (k === 'z') {
+          e.preventDefault();
+          if (e.shiftKey) redo(); else undo();
+        } else if (k === 'y') {
+          e.preventDefault();
+          redo();
+        }
+      });
+      window.addEventListener('keyup', (e) => {
+        if (e.key === 'Shift' && shiftDown) {
+          shiftDown = false;
+          endPeek();
+          processHover();  // re-evaluate to restore the normal outline
+        }
+      });
+      // Releasing focus (Cmd-Tab away while holding Shift) doesn't always fire
+      // a keyup. Reset state on blur so we don't get stuck peek-hidden.
+      window.addEventListener('blur', () => {
+        if (shiftDown) {
+          shiftDown = false;
+          endPeek();
+        }
+      });
+
+      // Pre-compute outlines in the background (one per idle slot) so the
+      // first hover on any part is instant. Big parts (fuse_2 ~1.4M tris)
+      // take ~200 ms — doing them upfront avoids the hitch on first hover.
+      const outlineQueue = meshes.slice();
+      function precomputeOne() {
+        if (outlineQueue.length === 0) return;
+        ensureOutline(outlineQueue.shift());
+        const schedule = window.requestIdleCallback || ((cb) => setTimeout(cb, 0));
+        schedule(precomputeOne);
+      }
+      const schedule = window.requestIdleCallback || ((cb) => setTimeout(cb, 100));
+      schedule(precomputeOne);
     }
 
     function initViewer(path) {
