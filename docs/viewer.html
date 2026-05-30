@@ -99,6 +99,7 @@
     <button id="surface-angle" title="Color faces by surface angle (normal direction)">Surface angle</button>
     <button id="rotate" title="Auto-rotate">Auto-rotate</button>
     <button id="show-all" title="Show any hidden parts" style="display: none">Show all</button>
+    <button id="download" title="Download this STL" style="display: none">Download</button>
     <span class="spacer"></span>
     <span class="label" id="hover-label"></span>
     <span class="label" id="dims"></span>
@@ -748,6 +749,24 @@
           controls.target.copy(initialCam.target);
           camera.lookAt(controls.target);
           controls.update();
+        });
+
+        // Wire up the download button to save the loaded STL buffer locally
+        // with its original filename. Cross-origin <a download> on jsDelivr
+        // URLs is unreliable, so we serve the bytes we already fetched
+        // through a blob URL.
+        const downloadBtn = document.getElementById('download');
+        downloadBtn.style.display = '';
+        downloadBtn.addEventListener('click', () => {
+          const blob = new Blob([buf], { type: 'model/stl' });
+          const blobUrl = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = blobUrl;
+          a.download = path.split('/').pop();
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
         });
       }).catch(err => {
         showError(err.message, `Couldn't fetch <code>${path}</code>: ${err.message}<br>The file might exceed jsDelivr's 50 MB limit, or the path might be wrong.`);
